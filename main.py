@@ -16,6 +16,7 @@ from typing import List, Tuple, Dict
 import json
 import psutil
 import threading
+import sqlite3
 
 # ASCII арт и информация о программе
 PROGRAM_INFO = """
@@ -30,15 +31,6 @@ PROGRAM_INFO = """
         Version: 2.0.0 (GPU Accelerated)
         Created by: IgorBlink
         GitHub: https://github.com/IgorBlink
-
-Features:
-• GPU-ускоренная генерация Bitcoin адресов
-• Асинхронная проверка через множество API
-• Мультипоточная обработка
-• Сохранение результатов в базу данных
-• Оптимизированная производительность
-
-Press any key to start...
 """
 
 class ResourceMonitor:
@@ -68,7 +60,7 @@ class ResourceMonitor:
 
 class OptimizedAddressChecker:
     def __init__(self, batch_size: int = 1000, api_concurrency: int = 15,
-                 cpu_usage: int = 80, ram_usage: int = 80):
+                 cpu_usage: int = 80, ram_usage: int = 80, save_checked_addresses=True):
         self.batch_size = batch_size
         self.api_concurrency = api_concurrency
         self.cpu_target = cpu_usage
@@ -98,7 +90,35 @@ class OptimizedAddressChecker:
         self.last_adjustment_time = time.time()
         self.speed_history = []  # История скорости для анализа
         self.pattern_generator = PatternGenerator()
+        self.save_checked_addresses = save_checked_addresses
+        self.db_connection = sqlite3.connect('bitcoin_addresses.db')
+        self.cursor = self.db_connection.cursor()
+        self._create_tables()
         
+    def _create_tables(self):
+        """Создание необходимых таблиц в базе данных"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS checked_addresses (
+                address TEXT PRIMARY KEY,
+                n_tx INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                balance INTEGER DEFAULT 0,
+                last_checked TEXT
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS addresses_with_transactions (
+                address TEXT PRIMARY KEY,
+                n_tx INTEGER,
+                total_received INTEGER,
+                balance INTEGER,
+                first_found TEXT
+            )
+        ''')
+        
+        self.db_connection.commit()
+
     def adjust_resources(self, current_speed: float):
         current_time = time.time()
         stats = self.resource_monitor.get_stats()
@@ -234,18 +254,10 @@ class OptimizedAddressChecker:
 
 async def process_batch(addresses: List[Tuple[str, bytes]], 
                        checker: OptimizedAddressChecker,
-                       importer: BlockchainImporter) -> Dict:
+                       importer: BlockchainImporter,
+                       save_checked: bool = True) -> Dict:
+    """Асинхронная обработка пакета адресов"""
     results = {'checked': 0, 'with_tx': 0, 'errors': 0}
-    
-    # Разбиваем адреса на подгруппы для параллельной обработки
-    chunk_size = max(10, len(addresses) // psutil.cpu_count())
-    address_chunks = [addresses[i:i + chunk_size] for i in range(0, len(addresses), chunk_size)]
-    
-    async def process_chunk(chunk: List[Tuple[str, bytes]]):
-        tasks = []
-        for address, private_key in chunk:
-            tasks.append(check_single_address(address, private_key))
-        await asyncio.gather(*tasks)
     
     async def check_single_address(address: str, private_key: bytes):
         try:
@@ -259,52 +271,170 @@ async def process_batch(addresses: List[Tuple[str, bytes]],
                 print(f"   Адрес: {address}")
                 print(f"   Транзакций: {result['n_tx']}")
                 print(f"   Баланс: {result['balance']} satoshi")
-            else:
+            elif save_checked:  # Сохраняем пустые кошельки только если включена опция
                 importer.save_checked_address(address, private_key, "gpu_generated")
                 
         except Exception as e:
             results['errors'] += 1
+            print(f"\n❌ Ошибка при проверке {address}: {e}")
     
-    # Запускаем обработку чанков параллельно
-    chunk_tasks = [process_chunk(chunk) for chunk in address_chunks]
-    await asyncio.gather(*chunk_tasks)
+    tasks = []
+    for address, private_key in addresses:
+        tasks.append(check_single_address(address, private_key))
     
+    await asyncio.gather(*tasks)
     return results
 
-async def generate_and_check_addresses(
-    batch_size: int = 1000,
-    api_concurrency: int = 20,
-    cpu_usage: int = 80,
-    ram_usage: int = 80,
-    pattern_mode: str = 'random'  # 'random', 'pattern', 'shift', 'repeat', 'old_python', 'sequence'
-):
+def load_config():
+    """Загрузка настроек из конфиг файла"""
+    config_path = "btc_config.json"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"❌ Ошибка при чтении конфига: {e}")
+    return None
+
+def save_config(config):
+    """Сохранение настроек в конфиг файл"""
+    config_path = "btc_config.json"
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        print("\n✅ Настройки сохранены в конфиг файл")
+    except Exception as e:
+        print(f"❌ Ошибка при сохранении конфига: {e}")
+
+def get_settings():
+    """Получение настроек от пользователя или из конфига"""
+    config = load_config()
+    if config:
+        print("\n📝 Найден файл конфигурации. Использовать сохраненные настройки?")
+        print("   1 - Да")
+        print("   2 - Нет, ввести новые")
+        while True:
+            choice = msvcrt.getch().decode()
+            if choice == '1':
+                return config
+            elif choice == '2':
+                break
+    
+    # Запрашиваем новые настройки
+    settings = {}
+    
+    print("\n💻 НАСТРОЙКА ПАРАМЕТРОВ:")
+    
+    # CPU Usage
+    print("\nВведите желаемое использование CPU (10-100%):")
+    while True:
+        try:
+            cpu = int(input(">>> "))
+            if 10 <= cpu <= 100:
+                settings['cpu_usage'] = cpu
+                break
+            print("❌ Введите число от 10 до 100")
+        except ValueError:
+            print("❌ Введите корректное число")
+    
+    # RAM Usage
+    print("\nВведите желаемое использование RAM (10-100%):")
+    while True:
+        try:
+            ram = int(input(">>> "))
+            if 10 <= ram <= 100:
+                settings['ram_usage'] = ram
+                break
+            print("❌ Введите число от 10 до 100")
+        except ValueError:
+            print("❌ Введите корректное число")
+    
+    # Batch Size
+    print("\nВведите размер пакета (10-10000):")
+    while True:
+        try:
+            batch = int(input(">>> "))
+            if 10 <= batch <= 10000:
+                settings['batch_size'] = batch
+                break
+            print("❌ Введите число от 10 до 10000")
+        except ValueError:
+            print("❌ Введите корректное число")
+    
+    # API Concurrency
+    print("\nВведите количество одновременных API запросов (5-100):")
+    while True:
+        try:
+            api = int(input(">>> "))
+            if 5 <= api <= 100:
+                settings['api_concurrency'] = api
+                break
+            print("❌ Введите число от 5 до 100")
+        except ValueError:
+            print("❌ Введите корректное число")
+    
+    # Pattern Mode
+    print("\nВыберите режим генерации:")
+    print("1 - Случайный")
+    print("2 - По паттерну")
+    while True:
+        choice = msvcrt.getch().decode()
+        if choice == '1':
+            settings['pattern_mode'] = 'random'
+            break
+        elif choice == '2':
+            settings['pattern_mode'] = 'pattern'
+            break
+    
+    # Save Empty Addresses
+    print("\nСохранять пустые (отчеканные) адреса?")
+    print("1 - Да")
+    print("2 - Нет")
+    while True:
+        choice = msvcrt.getch().decode()
+        if choice == '1':
+            settings['save_checked'] = True
+            break
+        elif choice == '2':
+            settings['save_checked'] = False
+            break
+    
+    # Сохраняем настройки
+    save_config(settings)
+    
+    return settings
+
+async def generate_and_check_addresses():
     os.system('cls' if os.name == 'nt' else 'clear')
     print(PROGRAM_INFO)
     
-    print("\n💻 НАСТРОЙКИ:")
-    print(f"   CPU использование (цель): {cpu_usage}%")
-    print(f"   RAM использование (цель): {ram_usage}%")
+    # Получаем настройки
+    settings = get_settings()
+    
+    # Выводим текущие настройки
+    print("\n💻 ТЕКУЩИЕ НАСТРОЙКИ:")
+    print(f"   CPU использование (цель): {settings['cpu_usage']}%")
+    print(f"   RAM использование (цель): {settings['ram_usage']}%")
     print(f"   Доступно ядер CPU: {psutil.cpu_count()}")
     print(f"   Доступно RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB")
-    print(f"   Размер пакета: {batch_size}")
-    print(f"   Режим генерации: {pattern_mode}")
+    print(f"   Размер пакета: {settings['batch_size']}")
+    print(f"   Режим генерации: {settings['pattern_mode']}")
+    print(f"   Сохранение отчеканных адресов: {'Включено' if settings['save_checked'] else 'Отключено'}")
+    print(f"   Сохранение адресов с балансом: Включено")
     
-    if pattern_mode != 'random':
-        print("\n📋 Доступные паттерны:")
-        for name in COMMON_PATTERNS:
-            print(f"   • {name}")
-    
-    print("\n Нажмите любую клавишу для запуска...")
+    print("\nНажмите любую клавишу для запуска...")
     msvcrt.getch()
     os.system('cls' if os.name == 'nt' else 'clear')
     
+    # Дальше используем полученные настройки
     db_path = "test.db"
     importer = BlockchainImporter(db_path)
     checker = OptimizedAddressChecker(
-        batch_size=batch_size,
-        api_concurrency=api_concurrency,
-        cpu_usage=cpu_usage,
-        ram_usage=ram_usage
+        batch_size=settings['batch_size'],
+        api_concurrency=settings['api_concurrency'],
+        cpu_usage=settings['cpu_usage'],
+        ram_usage=settings['ram_usage'],
+        save_checked_addresses=settings['save_checked']
     )
     
     await checker.init_session()
@@ -322,44 +452,19 @@ async def generate_and_check_addresses(
             print(f"\n📝 Генерация пакета {batch_num}...")
             
             # Генерируем адреса в зависимости от режима
-            if pattern_mode == 'random':
+            if settings['pattern_mode'] == 'random':
                 addresses = checker.pattern_generator.generate_with_pattern(
-                    [], [], batch_size
+                    [], [], settings['batch_size']
                 )
-            elif pattern_mode == 'pattern':
-                # Используем все паттерны по очереди
-                pattern_name = list(COMMON_PATTERNS.keys())[batch_num % len(COMMON_PATTERNS)]
-                pattern, mask = COMMON_PATTERNS[pattern_name]
-                print(f"   Используем паттерн: {pattern_name}")
+            else:
                 addresses = checker.pattern_generator.generate_with_pattern(
-                    pattern, mask, batch_size
-                )
-            elif pattern_mode == 'old_python':
-                # Используем паттерны старого Python
-                addresses = checker.pattern_generator.generate_with_old_python_pattern(batch_size)
-            elif pattern_mode == 'sequence':
-                # Используем последовательный сдвиг
-                base_pattern = [1,1,0,0,1,0,1,0] * 4
-                addresses = checker.pattern_generator.generate_with_shift_sequence(
-                    base_pattern, batch_size
-                )
-            elif pattern_mode == 'shift':
-                # Используем сдвиговый паттерн
-                base_pattern = [1,1,0,0,1,0,1,0] * 4
-                addresses = checker.pattern_generator.generate_with_shift_pattern(
-                    base_pattern, 8, batch_size
-                )
-            else:  # repeat
-                # Используем повторяющийся паттерн
-                base_pattern = [1,0,1,1,0,0,1,0]
-                addresses = checker.pattern_generator.generate_with_repeating_pattern(
-                    base_pattern, batch_size
+                    COMMON_PATTERNS[settings['pattern_mode']], [], settings['batch_size']
                 )
             
             print(f"\n🔍 Проверка пакета из {len(addresses)} адресов...")
-            batch_stats = await process_batch(addresses, checker, importer)
+            batch_stats = await process_batch(addresses, checker, importer, settings['save_checked'])  # Передаем параметр save_checked
             
-            # Обновляем статистику и выводим её
+            # Обновляем общую статистику
             for key in batch_stats:
                 total_stats[key] += batch_stats[key]
             
@@ -378,7 +483,7 @@ async def generate_and_check_addresses(
             print(f"   🚀 Скорость: {current_speed:.1f} адресов/сек")
             print(f"   💻 CPU: {resource_stats['cpu']:.1f}%")
             print(f"   🧮 RAM: {resource_stats['ram']:.1f}%")
-            print(f"   📦 Текущий размер пакета: {batch_size}")
+            print(f"   📦 Текущий размер пакета: {settings['batch_size']}")
             print(f"   🔄 Текущее кол-во параллельных запросов: {checker.api_concurrency}")
             if len(checker.speed_history) > 1:
                 print(f"   📈 Тренд скорости: {'↑' if checker.speed_history[-1] > checker.speed_history[0] else '↓'}")
@@ -395,44 +500,7 @@ async def generate_and_check_addresses(
 
 if __name__ == "__main__":
     try:
-        print("\n💻 НАСТРОЙКА ПАРАМЕТРОВ")
-        cpu_usage = int(input("Введите желаемый процент использования CPU (1-100): "))
-        ram_usage = int(input("Введите желаемый процент использования RAM (1-100): "))
-        batch_size = int(input("Введите размер пакета (10-1000): "))
-        api_concurrency = int(input("Введите начальное количество параллельных запросов (10-100): "))
-        
-        print("\nВыберите режим генерации:")
-        print("1. Случайная генерация")
-        print("2. Генерация по паттернам из старых библиотек")
-        print("3. Генерация со сдвигом")
-        print("4. Генерация с повторением")
-        print("5. Имитация багов старого Python")
-        print("6. Последовательный сдвиг")
-        mode = int(input("Введите номер режима (1-6): "))
-        
-        mode_map = {
-            1: 'random',
-            2: 'pattern',
-            3: 'shift',
-            4: 'repeat',
-            5: 'old_python',
-            6: 'sequence'
-        }
-        pattern_mode = mode_map.get(mode, 'random')
-        
-        # Проверяем и корректируем значения
-        cpu_usage = max(1, min(100, cpu_usage))
-        ram_usage = max(1, min(100, ram_usage))
-        batch_size = max(10, min(1000, batch_size))
-        api_concurrency = max(10, min(100, api_concurrency))
-        
-        asyncio.run(generate_and_check_addresses(
-            batch_size=batch_size,
-            api_concurrency=api_concurrency,
-            cpu_usage=cpu_usage,
-            ram_usage=ram_usage,
-            pattern_mode=pattern_mode
-        ))
+        asyncio.run(generate_and_check_addresses())
     except KeyboardInterrupt:
         print("\n\n⚠️ Программа остановлена пользователем")
     except Exception as e:
